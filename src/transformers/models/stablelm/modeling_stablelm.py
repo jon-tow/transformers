@@ -203,19 +203,22 @@ class StableLmMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class StableLmLayerNormPerHead(nn.Module):
-    def __init__(self, dim, num_heads, eps=1e-5, bias=False):
+# Copied from transformers.models.cohere.modeling_cohere.CohereLayerNorm with Cohere->StableLm
+class StableLmLayerNorm(nn.Module):
+    def __init__(self, hidden_size=None, eps=1e-5, bias=False):
+        """The hidden size can be a tuple or an int. The tuple is used for QKNorm to normalize across head_dim"""
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.norms = nn.ModuleList([nn.LayerNorm(dim, eps=eps, bias=bias) for _ in range(self.num_heads)])
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor):
-        # Split along the num_heads axis to get per-head inputs
-        # [batch_size, num_heads, seq_len, head_dim] -> [batch_size, 1, seq_len, head_dim] * num_heads
-        states_per_heads = torch.split(hidden_states, 1, dim=1)
-        # Normalize and merge the heads back together
-        return torch.cat([norm(hidden_states) for norm, hidden_states in zip(self.norms, states_per_heads)], dim=1)
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        mean = hidden_states.mean(-1, keepdim=True)
+        variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
+        hidden_states = (hidden_states - mean) * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight.to(torch.float32) * hidden_states
+        return hidden_states.to(input_dtype)
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -267,10 +270,8 @@ class StableLmAttention(nn.Module):
 
         self.qk_layernorm = config.qk_layernorm
         if self.qk_layernorm:
-            self.q_layernorm = StableLmLayerNormPerHead(self.head_dim, self.num_heads, eps=config.layer_norm_eps)
-            self.k_layernorm = StableLmLayerNormPerHead(
-                self.head_dim, self.num_key_value_heads, eps=config.layer_norm_eps
-            )
+            self.q_layernorm = StableLmLayerNorm((self.num_heads, self.head_dim), eps=config.layer_norm_eps)
+            self.k_layernorm = StableLmLayerNorm((self.num_key_value_heads, self.head_dim), eps=config.layer_norm_eps)
 
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         self._init_rope()
@@ -318,13 +319,16 @@ class StableLmAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -431,13 +435,16 @@ class StableLmSdpaAttention(StableLmAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -539,13 +546,16 @@ class StableLmFlashAttention2(StableLmAttention):
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:

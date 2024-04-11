@@ -488,7 +488,9 @@ class StableLmModelIntegrationTest(unittest.TestCase):
         # Check parallel residual and qk layernorm forward pass
         input_ids = {"input_ids": torch.tensor([[510, 8588, 310, 1900, 9386]], dtype=torch.long, device=torch_device)}
 
-        model = StableLmForCausalLM.from_pretrained("stabilityai/tiny-random-stablelm-2").to(torch_device)
+        model = StableLmForCausalLM.from_pretrained(
+            "stabilityai/tiny-random-stablelm-2", revision="stack-per-head-qk-norm"
+        ).to(torch_device)
         model.eval()
 
         output = model(**input_ids).logits
@@ -505,7 +507,9 @@ class StableLmModelIntegrationTest(unittest.TestCase):
     def test_model_tiny_random_stablelm_2_generation(self):
         # Check parallel residual and qk layernorm generation
         tokenizer = AutoTokenizer.from_pretrained("stabilityai/tiny-random-stablelm-2")
-        model = StableLmForCausalLM.from_pretrained("stabilityai/tiny-random-stablelm-2")
+        model = StableLmForCausalLM.from_pretrained(
+            "stabilityai/tiny-random-stablelm-2", revision="stack-per-head-qk-norm"
+        )
         input_ids = tokenizer.encode(
             "My favorite ride at the amusement park",
             return_tensors="pt",
